@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # AI & TEE (PYTHON): Aggiorna le librerie dentro requirements.txt (es. torch, transformers)
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly" # Controlla gli aggiornamenti ogni settimana
+    open-pull-requests-limit: 3 # Massimo 3 Pull Request aperte insieme
