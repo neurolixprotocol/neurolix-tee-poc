@@ -1,5 +1,5 @@
 # neurolix-tee-poc — Confidential Compute PoC dependencies
 numpy>=1.26
 scikit-learn>=1.4
-transformers>=4.38
+transformers>=5.11.0
 torch>=2.2
