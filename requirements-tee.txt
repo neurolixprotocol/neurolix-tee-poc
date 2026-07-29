@@ -1,0 +1,7 @@
+# Confidential medical inference (TEE runtime + build).
+# MUST match the versions used by build_model.py at image-build time.
+# Pin exact + hash-lock for production (pip --require-hashes).
+numpy==2.4.6
+scikit-learn==1.9.0
+cryptography==48.0.0
+joblib==1.5.3

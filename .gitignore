@@ -1,0 +1,8 @@
+out/
+cache/
+lib/
+model.joblib
+model.sha256
+__pycache__/
+*.pyc
+.env
