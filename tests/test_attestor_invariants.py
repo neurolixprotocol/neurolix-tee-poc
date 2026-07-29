@@ -105,7 +105,7 @@ def main() -> int:
     expect_refused(
         "an archived (expired) token is refused in live mode",
         lambda: _verify(bundle, mode=MODE_LIVE),
-        because="verification failed",
+        because="has expired",
     )
 
     # --- 3. No silent downgrade ------------------------------------------------

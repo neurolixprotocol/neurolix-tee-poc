@@ -291,7 +291,22 @@ def verify_cs_token(
         )
     except AttestorError:
         raise
-    except Exception as exc:  # signature/aud/iss/exp failures land here
+    except jwt.ExpiredSignatureError as exc:
+        # Expiry and forgery previously produced the same message. An operator
+        # debugging a live rejection must be able to tell "this proof is old"
+        # from "this proof is fake" — they call for opposite responses.
+        raise AttestorError("attestation token has expired") from exc
+    except jwt.ImmatureSignatureError as exc:
+        raise AttestorError("attestation token is not yet valid (nbf is in the future)") from exc
+    except jwt.InvalidSignatureError as exc:
+        raise AttestorError("attestation token signature is invalid") from exc
+    except jwt.InvalidAudienceError as exc:
+        raise AttestorError("attestation token audience does not match the expected relying party") from exc
+    except jwt.InvalidIssuerError as exc:
+        raise AttestorError("attestation token issuer is not Confidential Space") from exc
+    except jwt.MissingRequiredClaimError as exc:
+        raise AttestorError(f"attestation token is missing a required claim: {exc.claim}") from exc
+    except Exception as exc:  # anything else stays deliberately opaque
         raise AttestorError("attestation token verification failed") from exc
 
     _check_cs_claims(claims, hwmodel_allowlist=hwmodel_allowlist)

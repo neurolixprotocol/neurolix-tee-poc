@@ -1,0 +1,55 @@
+name: Attestation invariants
+
+# These checks guard properties whose silent loss would break nothing visible:
+# the archival/live separation, the no-downgrade rule, the root pin, and the
+# refusal to sign an archived proof for on-chain submission. CodeQL will not
+# catch any of them — they are semantic, not structural.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bridge/**'
+      - 'tests/**'
+      - 'verify.py'
+      - 'attestation.py'
+      - 'attestations/**'
+      - '.github/workflows/attestor-tests.yml'
+  pull_request:
+    branches: [main]
+  # Monthly, so a change on Google's side surfaces here rather than in an
+  # auditor's terminal. The published bundle must stay verifiable indefinitely.
+  schedule:
+    - cron: '0 6 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  invariants:
+    name: Verify the published attestation bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install attestor dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r bridge/requirements-attestor.txt
+
+      # The standalone verifier is what a third party actually runs. If it
+      # breaks, nobody on the team notices — they all use the attestor.
+      - name: Verify the published bundle with the standalone verifier
+        run: python3 verify.py attestations/bundle-pki-v4.json
+
+      - name: Check the attestor security invariants
+        run: python3 tests/test_attestor_invariants.py
