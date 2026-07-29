@@ -164,6 +164,21 @@ def main() -> int:
         because="does not match its own fields",
     )
 
+    # --- 7. Audience override is rejected --------------------------------------
+    print("\n7. Audience override is rejected")
+    expect_refused(
+        "expected_audience cannot diverge from the derived audience",
+        lambda: attest(
+            json.dumps(bundle),
+            private_key=DUMMY_KEY,
+            chain_id=8453,
+            verifier_address="0xDcCCda8662996b479bE5C5d44115a03a43a92F1B",
+            expected_audience="neurolix://base/8453/0xbadbadbadbadbadbadbadbadbadbadbadbadbad",
+            mode=MODE_LIVE,
+        ),
+        because="expected_audience does not match",
+    )
+
     print()
     if _failures:
         print(f"RESULT: {len(_failures)} invariant(s) BROKEN\n")

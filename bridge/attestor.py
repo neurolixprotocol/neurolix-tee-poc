@@ -563,7 +563,18 @@ def attest(
             "be signed for on-chain submission"
         )
     bundle = json.loads(bundle_json)
-    audience = expected_audience or protocol_audience(chain_id, verifier_address)
+    derived = protocol_audience(chain_id, verifier_address)
+    if expected_audience is not None and expected_audience != derived:
+        # The audience names the relying party the enclave minted the token for.
+        # verifyingContract names the contract that will check the signature.
+        # Letting them diverge defeats check (3): a token addressed to relying
+        # party A would authorise a claim submitted to verifier B.
+        raise AttestorError(
+            "expected_audience does not match the audience derived from "
+            "(chain_id, verifier_address); refusing to decouple the relying party "
+            "from the signing domain"
+        )
+    audience = derived
     claim = verify_bundle(
         bundle,
         expected_audience=audience,
