@@ -2,7 +2,7 @@
 
 **Status:** all findings that block a public proof are closed. Two are
 deliberately out of scope and declared as such below.
-**Audited artifact:** the v1 PoC, preserved at tag [`v1-poc`](../../tree/v1-poc) (`neurolix_inference.py`, `neurolix_llm.py`).
+**Audited artifact:** the v1 PoC, preserved at tag [`v1-poc`](../tree/v1-poc) (`neurolix_inference.py`, `neurolix_llm.py`).
 **Remediated artifact:** the v2 PoC in this repository, image digest
 `sha256:f59c6434b5ab1760f03a901d1579ceea649962b49e64f93d97a0305c7e6d2baf`.
 
