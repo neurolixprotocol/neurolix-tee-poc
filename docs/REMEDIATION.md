@@ -125,12 +125,14 @@ independent freshness guarantee.
 (`0xDcCCda8662996b479bE5C5d44115a03a43a92F1B`) holds zero transactions. This
 PoC stops at an off-chain verifiable bundle by design.
 
-### The off-chain verifier is incomplete
+### The off-chain verifier does not submit on chain
 
-`bridge/attestor.py` validates OIDC tokens against Google's JWKS. It does not
-yet implement the PKI path (x5c chain against the Confidential Space root),
-which is what the published artifact uses, and it has no archival verification
-mode — see below.
+`bridge/attestor.py` verifies both token types — OIDC against Google's JWKS,
+PKI against a vendored root pinned by digest — in either a live or an archival
+temporal mode, and signs an EIP-712 claim. What it does not do is submit that
+claim: there is no relay, and `NeurolixAttestation.sol` holds zero
+transactions. The chain from enclave to contract is built but never walked.
+</parameter>
 
 ---
 

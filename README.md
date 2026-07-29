@@ -173,7 +173,7 @@ build_model.py           build-time: trains and hashes the baked model
 make_payload.py          build-time: produces the encrypted payload
 requirements-tee.txt     pinned enclave dependencies
 payload.json             encrypted synthetic payload (baked into the image)
-bridge/attestor.py       off-chain verifier (OIDC path; PKI path pending)
+bridge/attestor.py       off-chain verifier — OIDC and PKI, live and archival
 attestations/            the three bundles produced during this work
 docs/                    the v1 security audit and this work's remediation
 ```
