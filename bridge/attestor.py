@@ -44,14 +44,21 @@ Dependencies (see requirements at the bottom of this file):
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import time
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Final, Iterable
 
 import jwt  # PyJWT
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from eth_utils import keccak
@@ -69,6 +76,21 @@ CS_DISCOVERY_URL: Final[str] = CS_ISSUER + "/.well-known/openid-configuration"
 ALLOWED_ALGS: Final[list[str]] = ["RS256"]
 REQUIRED_SWNAME: Final[str] = "CONFIDENTIAL_SPACE"
 REQUIRED_DBGSTAT: Final[str] = "disabled-since-boot"
+
+# Token types. OIDC signatures are checked against a JWKS key that Google
+# rotates; PKI tokens carry their own certificate chain and verify offline
+# against a long-lived root, which is what an archived artifact needs.
+TOKEN_TYPE_OIDC: Final[str] = "OIDC"
+TOKEN_TYPE_PKI: Final[str] = "PKI"
+
+# Verification modes — see verify_cs_token for the full semantics.
+MODE_LIVE: Final[str] = "live"
+MODE_ARCHIVAL: Final[str] = "archival"
+
+# Vendored Confidential Space root, pinned by digest. Replacing the file
+# without updating this constant makes verification fail closed.
+_DEFAULT_ROOT_PATH: Final[Path] = Path(__file__).with_name("confidential_space_root.pem")
+CS_ROOT_SHA256: Final[str] = "148b293821bb0c6a317f413c8ba475814091cb22d49b9e3c94198db8e8f86c39"
 # Confirm exact hwmodel strings against the current GCP "Attestation token
 # claims" documentation before locking these down in production.
 DEFAULT_HWMODEL_ALLOWLIST: Final[frozenset[str]] = frozenset({"GCP_AMD_SEV", "GCP_INTEL_TDX"})
@@ -109,6 +131,81 @@ def _fetch_jwks_uri(discovery_url: str = CS_DISCOVERY_URL, timeout: float = 10.0
         raise AttestorError("failed to fetch OIDC discovery document") from exc
 
 
+def _load_pinned_root(root_pem_path: str | Path | None) -> x509.Certificate:
+    """Load the vendored Confidential Space root and check it against the pin."""
+    path = Path(root_pem_path) if root_pem_path else _DEFAULT_ROOT_PATH
+    try:
+        root = x509.load_pem_x509_certificate(path.read_bytes())
+    except Exception as exc:
+        raise AttestorError(f"cannot load the pinned root certificate at {path}") from exc
+    digest = hashlib.sha256(root.public_bytes(serialization.Encoding.DER)).hexdigest()
+    if digest != CS_ROOT_SHA256:
+        raise AttestorError("pinned root certificate does not match CS_ROOT_SHA256")
+    return root
+
+
+def _token_chain(token: str) -> list[x509.Certificate] | None:
+    """Return the x5c chain from the JWT header, or None for an OIDC token."""
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception as exc:
+        raise AttestorError("malformed attestation token header") from exc
+    x5c = header.get("x5c")
+    if not x5c:
+        return None
+    if not isinstance(x5c, list) or len(x5c) < 2:
+        raise AttestorError("x5c chain is malformed or too short")
+    try:
+        return [x509.load_der_x509_certificate(base64.b64decode(c)) for c in x5c]
+    except Exception as exc:
+        raise AttestorError("x5c chain contains an unparseable certificate") from exc
+
+
+def _signed_by(child: x509.Certificate, parent: x509.Certificate) -> bool:
+    try:
+        parent.public_key().verify(  # type: ignore[union-attr]
+            child.signature,
+            child.tbs_certificate_bytes,
+            padding.PKCS1v15(),
+            child.signature_hash_algorithm,  # type: ignore[arg-type]
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _verify_pki_chain(
+    chain: list[x509.Certificate],
+    *,
+    at_time: datetime,
+    root_pem_path: str | Path | None,
+) -> x509.Certificate:
+    """Validate leaf <- ... <- root against the pinned root and return the leaf.
+
+    Every certificate's validity window is checked at `at_time`, not at `now`.
+    Confidential Space leaf certificates live about two months, so an archived
+    bundle checked against the current clock would fail for the wrong reason —
+    an expired leaf, not an invalid proof.
+    """
+    pinned = _load_pinned_root(root_pem_path)
+    root = chain[-1]
+    if root.fingerprint(hashes.SHA256()) != pinned.fingerprint(hashes.SHA256()):
+        raise AttestorError("x5c chain does not terminate at the pinned root")
+
+    for cert in chain:
+        if not (cert.not_valid_before_utc <= at_time <= cert.not_valid_after_utc):
+            subject = cert.subject.rfc4514_string().split(",")[0]
+            raise AttestorError(f"certificate outside its validity window at the checked instant: {subject}")
+
+    for child, parent in zip(chain, chain[1:]):
+        if not _signed_by(child, parent):
+            raise AttestorError("x5c chain is not correctly signed")
+    if not _signed_by(root, root):
+        raise AttestorError("root certificate is not self-signed")
+
+    return chain[0]
+
+
 def verify_cs_token(
     token: str,
     *,
@@ -116,21 +213,81 @@ def verify_cs_token(
     hwmodel_allowlist: Iterable[str] = DEFAULT_HWMODEL_ALLOWLIST,
     leeway_s: int = DEFAULT_LEEWAY_S,
     jwks_uri: str | None = None,
+    require_token_type: str | None = None,
+    mode: str = MODE_LIVE,
+    root_pem_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Verify the Confidential Space OIDC token end-to-end and return its claims.
-    Raises AttestorError on any failure."""
+    """Verify a Confidential Space attestation token and return its claims.
+
+    The token type is detected from the header: a token carrying an `x5c` chain
+    is PKI, otherwise it is OIDC. Pass `require_token_type` to pin the
+    expectation and fail closed on a downgrade — auto-detection alone would let
+    a caller expecting an offline-verifiable PKI token silently accept an OIDC
+    one whose verifiability depends on a key Google rotates.
+
+    `mode` selects the temporal policy:
+      MODE_LIVE     enforce `exp`; validate the chain at `now`. The only mode
+                    acceptable for an authorisation decision.
+      MODE_ARCHIVAL do not enforce `exp`; validate the chain at the token's
+                    `iat`. For a published artifact, where the question is
+                    whether the token was validly issued, not whether it is
+                    still current.
+
+    MODE_ARCHIVAL must never gate an on-chain submission — see `attest`.
+    """
+    if mode not in (MODE_LIVE, MODE_ARCHIVAL):
+        raise AttestorError(f"unknown verification mode: {mode!r}")
+    if require_token_type is not None and require_token_type not in (TOKEN_TYPE_OIDC, TOKEN_TYPE_PKI):
+        raise AttestorError(f"unknown token type requirement: {require_token_type!r}")
+
+    chain = _token_chain(token)
+    detected = TOKEN_TYPE_PKI if chain else TOKEN_TYPE_OIDC
+    if require_token_type is not None and detected != require_token_type:
+        raise AttestorError(f"expected a {require_token_type} token, got {detected}")
+
+    if chain is not None:
+        at_time = datetime.now(timezone.utc)
+        if mode == MODE_ARCHIVAL:
+            # `iat` is read unverified ONLY to choose the instant at which the
+            # chain is checked. It grants no trust: the signature is verified
+            # immediately below against a chain that must terminate at the
+            # pinned root, so a forged `iat` cannot widen the trusted set.
+            try:
+                unverified = jwt.decode(token, options={"verify_signature": False})
+                at_time = datetime.fromtimestamp(int(unverified["iat"]), tz=timezone.utc)
+            except Exception as exc:
+                raise AttestorError("token has no usable iat for archival verification") from exc
+        leaf = _verify_pki_chain(chain, at_time=at_time, root_pem_path=root_pem_path)
+        key = leaf.public_key()
+        if not isinstance(key, rsa.RSAPublicKey):
+            raise AttestorError("leaf certificate does not carry an RSA public key")
+        signing_key: Any = key
+    else:
+        if mode == MODE_ARCHIVAL:
+            _log.warning(
+                "archival verification of an OIDC token: it will stop verifying "
+                "once Google rotates the signing key. Prefer a PKI token."
+            )
+        try:
+            uri = jwks_uri or _fetch_jwks_uri()
+            signing_key = jwt.PyJWKClient(uri).get_signing_key_from_jwt(token).key
+        except AttestorError:
+            raise
+        except Exception as exc:
+            raise AttestorError("could not resolve the OIDC signing key") from exc
+
     try:
-        uri = jwks_uri or _fetch_jwks_uri()
-        jwk_client = jwt.PyJWKClient(uri)
-        signing_key = jwk_client.get_signing_key_from_jwt(token)
         claims = jwt.decode(
             token,
-            signing_key.key,
+            signing_key,
             algorithms=ALLOWED_ALGS,
             audience=expected_audience,
             issuer=CS_ISSUER,
             leeway=leeway_s,
-            options={"require": ["exp", "iat", "aud", "iss"]},
+            options={
+                "require": ["exp", "iat", "aud", "iss"],
+                "verify_exp": mode == MODE_LIVE,
+            },
         )
     except AttestorError:
         raise
@@ -138,6 +295,7 @@ def verify_cs_token(
         raise AttestorError("attestation token verification failed") from exc
 
     _check_cs_claims(claims, hwmodel_allowlist=hwmodel_allowlist)
+    _log.info("token verified (type=%s, mode=%s)", detected, mode)
     return claims
 
 
@@ -219,6 +377,9 @@ def verify_bundle(
     claim_ttl_s: int = DEFAULT_CLAIM_TTL_S,
     leeway_s: int = DEFAULT_LEEWAY_S,
     jwks_uri: str | None = None,
+    require_token_type: str | None = None,
+    mode: str = MODE_LIVE,
+    root_pem_path: str | Path | None = None,
     now: int | None = None,
 ) -> VerifiedClaim:
     """Verify the enclave bundle and the embedded token, then return the fields
@@ -243,6 +404,9 @@ def verify_bundle(
         hwmodel_allowlist=hwmodel_allowlist,
         leeway_s=leeway_s,
         jwks_uri=jwks_uri,
+        require_token_type=require_token_type,
+        mode=mode,
+        root_pem_path=root_pem_path,
     )
 
     # (3) The token's eat_nonce MUST equal the recomputed binding nonce. This is
@@ -365,10 +529,24 @@ def attest(
     claim_ttl_s: int = DEFAULT_CLAIM_TTL_S,
     leeway_s: int = DEFAULT_LEEWAY_S,
     jwks_uri: str | None = None,
+    require_token_type: str | None = None,
+    root_pem_path: str | Path | None = None,
+    mode: str = MODE_LIVE,
 ) -> dict[str, Any]:
     """Verify an enclave bundle and return a signed, submit-ready claim.
     `expected_audience` defaults to the protocol audience the enclave derives
-    from (chain_id, verifier_address)."""
+    from (chain_id, verifier_address).
+
+    HARD CONSTRAINT: archival verification can never produce a signed claim.
+    An archived proof has an expired token by construction; treating it as an
+    authorisation would turn every published bundle into a free replay against
+    the on-chain verifier.
+    """
+    if mode != MODE_LIVE:
+        raise AttestorError(
+            "attest() refuses non-live verification: an archived proof must never "
+            "be signed for on-chain submission"
+        )
     bundle = json.loads(bundle_json)
     audience = expected_audience or protocol_audience(chain_id, verifier_address)
     claim = verify_bundle(
@@ -379,6 +557,9 @@ def attest(
         claim_ttl_s=claim_ttl_s,
         leeway_s=leeway_s,
         jwks_uri=jwks_uri,
+        require_token_type=require_token_type,
+        mode=MODE_LIVE,
+        root_pem_path=root_pem_path,
     )
     return sign_claim(private_key, chain_id=chain_id, verifier_address=verifier_address, claim=claim)
 
@@ -398,6 +579,4 @@ if __name__ == "__main__":  # pragma: no cover
     signed = attest(bundle_json, private_key=pk, chain_id=chain_id, verifier_address=verifier)
     print(json.dumps(signed, indent=2))
 
-# requirements-attestor.txt (pin + hash-lock in production):
-#   PyJWT[crypto]>=2.8
-#   eth-account>=0.11
+# Dependencies are declared in requirements-attestor.txt — single source.

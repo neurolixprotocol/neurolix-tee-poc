@@ -41,6 +41,12 @@ GOOGLE_ROOT_SHA256 = "148b293821bb0c6a317f413c8ba475814091cb22d49b9e3c94198db8e8
 
 EXPECTED_ISSUER = "https://confidentialcomputing.googleapis.com"
 
+# DELIBERATE DUPLICATION. bridge/attestor.py implements the same chain
+# validation. This file is kept standalone on purpose: an auditor should be
+# able to read one script with a single dependency rather than trace an import
+# graph. The cost is that a change to the verification logic must be applied in
+# BOTH files. If they ever disagree, bridge/attestor.py is authoritative.
+
 
 def b64url(segment: str) -> bytes:
     return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
@@ -134,6 +140,17 @@ def verify(path: str) -> int:
                 return True
             except Exception:
                 return False
+
+        # Leaf certificates live about two months. An archived bundle must be
+        # checked against the instant the token was issued, not against now.
+        from datetime import datetime, timezone
+
+        issued_at = datetime.fromtimestamp(int(claims["iat"]), tz=timezone.utc)
+        in_window = all(
+            c.not_valid_before_utc <= issued_at <= c.not_valid_after_utc for c in chain
+        )
+        r.check("every certificate was valid when the token was issued", in_window,
+                issued_at.isoformat())
 
         r.check("leaf signed by intermediate", signed_by(chain[0], chain[1]))
         r.check("intermediate signed by root", signed_by(chain[1], chain[2]))
