@@ -47,8 +47,8 @@ ENV PYTHONUNBUFFERED=1 \
 # operator-overridable: the verifier address and chain id determine the
 # attestation token's audience, so an operator able to change them could make
 # the enclave mint a token for a different relying party.
-ENV NEUROLIX_VERIFIER_ADDRESS=0xDcCCda8662996b479bE5C5d44115a03a43a92F1B \
-    NEUROLIX_CHAIN_ID=8453 \
+ENV NEUROLIX_VERIFIER_ADDRESS=0xBD5f47876Dc7DD20ECE7f09A65Bf4E65dfe289CF \
+    NEUROLIX_CHAIN_ID=84532 \
     NEUROLIX_PAYLOAD_FILE=/app/payload.json
 
 ENV NEUROLIX_TOKEN_TYPE=PKI
