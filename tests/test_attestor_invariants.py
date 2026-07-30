@@ -179,6 +179,25 @@ def main() -> int:
         because="expected_audience does not match",
     )
 
+    # --- 7b. ...but only when it actually diverges -----------------------------
+    # Case 7 proves the guard fires. This proves it does NOT over-fire: a
+    # matching expected_audience must pass through and let verification proceed,
+    # so the refusal we see here is the expired token, not the audience check.
+    # Without this, `raise` unconditionally would still pass case 7.
+    print("\n7b. A matching audience is not rejected by the audience guard")
+    expect_refused(
+        "an explicit but matching expected_audience reaches verification",
+        lambda: attest(
+            json.dumps(bundle),
+            private_key=DUMMY_KEY,
+            chain_id=8453,
+            verifier_address="0xDcCCda8662996b479bE5C5d44115a03a43a92F1B",
+            expected_audience="neurolix://base/8453/0xdcccda8662996b479be5c5d44115a03a43a92f1b",
+            mode=MODE_LIVE,
+        ),
+        because="has expired",
+    )
+
     print()
     if _failures:
         print(f"RESULT: {len(_failures)} invariant(s) BROKEN\n")
