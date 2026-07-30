@@ -3,8 +3,12 @@
 **Status:** all findings that block a public proof are closed. Two are
 deliberately out of scope and declared as such below.
 **Audited artifact:** the v1 PoC, preserved at tag [`v1-poc`](https://github.com/neurolixprotocol/neurolix-tee-poc/tree/v1-poc) (`neurolix_inference.py`, `neurolix_llm.py`).
-**Remediated artifact:** the v2 PoC in this repository, image digest
-`sha256:f59c6434b5ab1760f03a901d1579ceea649962b49e64f93d97a0305c7e6d2baf`.
+**Remediated artifact:** the v2 PoC in this repository. The bundle published for
+verification is `attestations/bundle-pki-v4.json`, image digest
+`sha256:f59c6434b5ab1760f03a901d1579ceea649962b49e64f93d97a0305c7e6d2baf`. The
+run anchored on Base Sepolia used
+`sha256:a757c3312535db1a2cf76d36047fc7867bd0e1fcd9b81e6e5522b0764a1ac6f2` —
+same source, rebuilt, hence a different digest.
 
 This document exists because publishing an audit without its remediation is
 half a story, and publishing a remediation without its audit is marketing.
@@ -36,7 +40,7 @@ So the correct characterisation of the v1 → v2 change is not
 | ID | Finding | Status | Where to verify |
 |----|---------|--------|-----------------|
 | **C1** | Payload "encryption" was base64 encoding | **Closed** | `inference.py::decrypt_payload` — AES-256-GCM with authenticated decryption, 12-byte nonce, schema bound as AAD. Key material arrives through a `KeyProvider` interface |
-| **C2** | Output commitment decoupled from the attestation token | **Closed** | `attestation.py::compute_binding_nonce` derives a nonce over `session_id ‖ model_digest ‖ input_commitment ‖ output_commitment`; that nonce is submitted as `eat_nonce` and appears inside the Google-signed token |
+| **C2** | Output commitment decoupled from the attestation token | **Closed** | `attestation.py::compute_binding_nonce` derives a nonce over `session_id ‖ model_digest ‖ input_commitment ‖ output_commitment`; that nonce is submitted as `eat_nonce` and appears inside the Google-signed token. Since 30 July 2026 the same binding is recomputed on chain — see "the relay" below |
 | **C3** | Sensitive plaintext written to stdout and logs | **Closed** | `inference.py` logs record counts only. The bundle carries hashes and the token, never payload contents |
 | **C4** | Model fetched from the network at runtime | **Closed** | `build_model.py` trains at image-build time; `Dockerfile` bakes `model.joblib` into the measured image; `inference.py::load_model` verifies its SHA-256 before loading and fails closed on mismatch |
 | **C5** | Report asserted claims it could not support | **Closed** | Every claim in `README.md` maps to a field inside the signed token. Claims that cannot be supported are listed under "Out of scope" below rather than omitted |
@@ -52,18 +56,19 @@ So the correct characterisation of the v1 → v2 change is not
 
 ## Determinism, demonstrated rather than asserted
 
-H1 is the finding most often claimed and least often shown. Three independent
-runs, on three separate VMs, at different times, using two different container
-images and both Confidential Space image families:
+H1 is the finding most often claimed and least often shown. Four independent
+runs, on four separate VMs, at different times across three days, using three
+different container images and both Confidential Space image families:
 
 | Run | Image | `input_commitment` | `output_commitment` |
 |-----|-------|--------------------|---------------------|
 | debug v3 | `sha256:227eb380…` | `0x39ba7add…` | `0xae9aaaee…` |
 | production v3 | `sha256:227eb380…` | `0x39ba7add…` | `0xae9aaaee…` |
 | production v4 (PKI) | `sha256:f59c6434…` | `0x39ba7add…` | `0xae9aaaee…` |
+| production v5 (relayed) | `sha256:a757c331…` | `0x39ba7add…` | `0xae9aaaee…` |
 
-The `binding_nonce` differs between v3 and v4 because `model_digest` changed —
-see the reproducibility limitation below.
+The `binding_nonce` differs between them because `model_digest` changes with
+every build — see the reproducibility limitation below.
 
 ---
 
@@ -119,20 +124,58 @@ would be the on-chain session under which the job is paid. Here it is an
 arbitrary 32-byte value, so it provides domain separation between runs but no
 independent freshness guarantee.
 
-### Nothing was anchored on chain
+### Nothing is anchored on Base Mainnet
 
 `NeurolixAttestation.sol` on Base Mainnet
-(`0xDcCCda8662996b479bE5C5d44115a03a43a92F1B`) holds zero transactions. This
-PoC stops at an off-chain verifiable bundle by design.
+(`0xDcCCda8662996b479bE5C5d44115a03a43a92F1B`) still holds zero transactions,
+and this PoC does not write to it. That contract is a permissionless registry:
+it accepts self-declared strings and verifies nothing, so anchoring into it
+would reintroduce C5 one layer down.
 
-### The off-chain verifier does not submit on chain
+### The relay: what was walked, and what was stubbed to walk it
 
-`bridge/attestor.py` verifies both token types — OIDC against Google's JWKS,
-PKI against a vendored root pinned by digest — in either a live or an archival
-temporal mode, and signs an EIP-712 claim. What it does not do is submit that
-claim: there is no relay, and `NeurolixAttestation.sol` holds zero
-transactions. The chain from enclave to contract is built but never walked.
-</parameter>
+The chain from enclave to contract is no longer merely built. On 30 July 2026 a
+claim produced by `bridge/attestor.py` was submitted to
+`NeurolixAttestationVerifier` on **Base Sepolia**
+(`0xBD5f47876Dc7DD20ECE7f09A65Bf4E65dfe289CF`), in transaction
+`0xa32529d0f442b68fa0074eec4d660f3d13de1aa11bbdf81c71e7ec43b0d92412`.
+
+The contract recomputed the binding nonce from the claim's own fields with the
+`sha256` precompile, recovered the signer from the EIP-712 signature, checked
+that signer against `ATTESTOR_ROLE`, matched the image digest against its
+allowlist, and consumed the nonce against replay. None of that was stubbed.
+
+Two things were.
+
+**The compute session is mocked.** The verifier requires an `IComputeSession`
+that confirms the session is active. `ComputeSession.sol` declares itself
+`SCAFFOLD — NOT PRODUCTION, NOT AUDITED`, and deploying it to satisfy a
+constructor argument would mean standing behind code that does not yet stand
+up. A minimal `MockComputeSession` answers the two view functions the verifier
+calls and does nothing else: it verifies nothing, tracks no nonces, emits no
+verification events. The verifier's `session` pointer is mutable, so the real
+contract replaces the mock without redeployment.
+
+**It is testnet.** A mocked session behind a contract that looks like it
+verifies things has no business on a chain where its events could be read as
+production claims.
+
+### The chain trusts the attestor key, not Google
+
+This is the limitation the relay introduces, and it is a reduction of trust
+rather than its removal.
+
+The Google-signed token is verified *off chain*, by `bridge/attestor.py`, which
+then signs an EIP-712 claim with `NEUROLIX_ATTESTOR_PRIVATE_KEY`. The contract
+never sees the JWT. It verifies that a key holding `ATTESTOR_ROLE` vouched for
+a computation, and that the claim is internally consistent and unreplayed.
+
+An on-chain attestation is therefore exactly as trustworthy as that key.
+Whoever holds it can anchor an arbitrary claim and the contract will accept it.
+Verifying the Google PKI chain on chain would remove the assumption; parsing
+X.509 and checking RSA signatures inside the EVM is why it was not done. Today
+the key sits in an environment variable — the same class of shortcut as C1, and
+it carries the same warning.
 
 ---
 
