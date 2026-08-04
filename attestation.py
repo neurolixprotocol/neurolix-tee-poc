@@ -76,7 +76,10 @@ EAT_NONCE_MAX_LEN: Final[int] = 74
 # Network timeout for the local socket call (fail-closed, do not hang the enclave).
 TOKEN_TIMEOUT_S: Final[float] = 10.0
 
-BUNDLE_VERSION: Final[str] = "neurolix-attestation/v1"
+# v2 (2026-08-03): adds `consumed_sec` to the binding nonce preimage and to the bundle.
+# A v1 bundle can no longer produce a nonce a v1.18 verifier will accept, and vice versa —
+# the version string is the tripwire that makes the mismatch loud instead of silent.
+BUNDLE_VERSION: Final[str] = "neurolix-attestation/v2"
 
 # Domain-separation tags. The *byte values* below are the SHA-256 of the tag
 # strings and are MIRRORED verbatim in NeurolixAttestationVerifier.sol as
@@ -164,22 +167,52 @@ def compute_binding_nonce(
     model_digest: bytes,
     input_commitment: bytes,
     output_commitment: bytes,
+    consumed_sec: int,
 ) -> bytes:
     """Fixed-width SHA-256 binding nonce, reproducible on-chain.
 
-    Preimage (160 bytes, all fixed 32-byte fields, order is load-bearing):
-        DST_NONCE || session_id || model_digest || input_commitment || output_commitment
+    Preimage (168 bytes: five fixed 32-byte fields + one 8-byte BE integer;
+    order is load-bearing):
+        DST_NONCE || session_id || model_digest || input_commitment
+                  || output_commitment || consumed_sec(uint64 BE)
 
     Mirrored in Solidity as:
         sha256(abi.encodePacked(DST_NONCE, sessionId, modelDigest,
-                                inputCommitment, outputCommitment))
+                                inputCommitment, outputCommitment, consumedSec))
+    where consumedSec is uint64 — abi.encodePacked emits exactly 8 big-endian
+    bytes for it, matching to_bytes(8, "big") here.
+
+    WHY consumed_sec IS IN HERE (v2, load-bearing):
+    the billed duration is what the client pays for. If it travelled beside the
+    nonce instead of inside it, the off-chain attestor could sign any number it
+    liked without the enclave ever having committed to it. Folding it into the
+    preimage means the value is bound to the same Google-signed eat_nonce as the
+    I/O commitments: altering it invalidates the token.
+
+    HONEST LIMITATION: this proves the ENCLAVE asserted the duration, not that the
+    duration is true. SEV-SNP and TDX expose no trusted clock — the host, i.e. the
+    node operator, owns the time the enclave reads. The on-chain settlement
+    therefore clamps this value to the elapsed time the chain itself measured
+    (see ComputeSession `_billable`: min(attested, physical, plafond)). Neither
+    bound is sufficient alone; each closes the attack the other opens.
     """
     _require_len(session_id, _HASH_LEN, "session_id")
     _require_len(model_digest, _HASH_LEN, "model_digest")
     _require_len(input_commitment, _HASH_LEN, "input_commitment")
     _require_len(output_commitment, _HASH_LEN, "output_commitment")
-    preimage = DST_NONCE + session_id + model_digest + input_commitment + output_commitment
-    assert len(preimage) == 5 * _HASH_LEN  # internal invariant
+    if not isinstance(consumed_sec, int) or isinstance(consumed_sec, bool):
+        raise AttestationError("consumed_sec must be an int")
+    if not (0 <= consumed_sec < 2**64):
+        raise AttestationError("consumed_sec must fit in uint64")
+    preimage = (
+        DST_NONCE
+        + session_id
+        + model_digest
+        + input_commitment
+        + output_commitment
+        + consumed_sec.to_bytes(8, "big")
+    )
+    assert len(preimage) == 5 * _HASH_LEN + 8  # internal invariant
     return _sha256(preimage)
 
 
@@ -292,6 +325,7 @@ class AttestationBundle:
     input_commitment: bytes
     output_commitment: bytes
     binding_nonce: bytes
+    consumed_sec: int  # v2: billable enclave duration, folded into the nonce preimage
     audience: str
     attestation_token: str  # Google-signed; image_digest lives in its claims
 
@@ -307,6 +341,7 @@ class AttestationBundle:
                 "input_commitment": "0x" + self.input_commitment.hex(),
                 "output_commitment": "0x" + self.output_commitment.hex(),
                 "binding_nonce": "0x" + self.binding_nonce.hex(),
+                "consumed_sec": self.consumed_sec,
                 "eat_nonce": self.binding_nonce.hex(),
                 "audience": self.audience,
                 "attestation_token": self.attestation_token,
@@ -321,6 +356,7 @@ def build_attestation_bundle(
     model_digest: bytes,
     canonical_input: bytes,
     canonical_output: bytes,
+    consumed_sec: int,
     chain_id: int,
     verifier_address: str,
     token_type: str = TOKEN_TYPE_OIDC,
@@ -341,7 +377,7 @@ def build_attestation_bundle(
     input_commitment = compute_input_commitment(canonical_input)
     output_commitment = compute_output_commitment(canonical_output)
     binding_nonce = compute_binding_nonce(
-        session_id, model_digest, input_commitment, output_commitment
+        session_id, model_digest, input_commitment, output_commitment, consumed_sec
     )
     audience = protocol_audience(chain_id, verifier_address)
     token = request_attestation_token(
@@ -354,6 +390,7 @@ def build_attestation_bundle(
         input_commitment=input_commitment,
         output_commitment=output_commitment,
         binding_nonce=binding_nonce,
+        consumed_sec=consumed_sec,
         audience=audience,
         attestation_token=token,
     )

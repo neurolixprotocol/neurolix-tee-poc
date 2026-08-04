@@ -35,6 +35,7 @@ import json
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
 
@@ -59,6 +60,32 @@ _RANGES: Final[dict[str, tuple[float, float]]] = {
 
 _MODEL_PATH: Final[str] = "model.joblib"
 _DIGEST_PATH: Final[str] = "model.sha256"
+
+# v1.18 metering. Captured at MODULE IMPORT, which is the earliest point the workload
+# controls — so the billed window covers model load, payload download and decryption,
+# not just the scoring call. Those are real GPU-blocking seconds for the node.
+#
+# time.monotonic(), never time.time(): a duration must not move when the host steps
+# the wall clock (NTP, a manual set, or a hostile operator). Monotonic is still
+# host-supplied — the enclave has no trusted clock — but it removes the trivial
+# manipulations and leaves only the ones the chain's own elapsed-time bound catches.
+_PROCESS_START_MONOTONIC: Final[float] = time.monotonic()
+
+# The node is never billed for less than this, even on an instant failure. It is the
+# floor that makes a corrupt-payload DoS cost the attacker something: without it, an
+# attacker uploads garbage, the node boots an enclave, fails in three seconds and earns
+# nothing. Mirrors ComputeSession.MIN_BILLABLE_SEC — the two MUST stay equal.
+_MIN_BILLABLE_SEC: Final[int] = 60
+
+
+def elapsed_consumed_sec() -> int:
+    """Billable enclave duration in whole seconds, rounded UP.
+
+    Rounded up so a sub-second run bills 1s rather than 0 — a zero would make the
+    on-chain settlement mint nothing for the node while still consuming the session.
+    """
+    elapsed = math.ceil(time.monotonic() - _PROCESS_START_MONOTONIC)
+    return max(int(elapsed), 1)
 
 _log = logging.getLogger("neurolix.inference")
 
@@ -263,12 +290,19 @@ def emit_attestation_bundle(
     verifier_address: str,
 ) -> att.AttestationBundle:
     """Wrap the deterministic result with the session-bound TEE attestation
-    (binding nonce includes session_id + model_digest + I/O commitments)."""
+    (binding nonce includes session_id + model_digest + I/O commitments +
+    consumed_sec).
+
+    consumed_sec is read HERE, at the last possible moment before the token is
+    requested, so the billed window is as close as possible to the true lifetime
+    of the workload. Everything after this point is token retrieval and printing.
+    """
     return att.build_attestation_bundle(
         session_id=session_id,
         model_digest=model_digest,
         canonical_input=result.canonical_input,
         canonical_output=result.canonical_output,
+        consumed_sec=elapsed_consumed_sec(),
         chain_id=chain_id,
         verifier_address=verifier_address,
         # PKI produces a self-contained token carrying its own x5c chain, so an
