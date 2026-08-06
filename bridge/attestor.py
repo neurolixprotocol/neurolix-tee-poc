@@ -372,6 +372,20 @@ def _b32(hexstr: str, name: str) -> bytes:
     return raw
 
 
+def _u64(value: Any, name: str) -> int:
+    """v1.18. Reads a uint64 field, failing closed on anything that is not one.
+
+    Deliberately strict: a bundle missing consumed_sec is a v1-scheme artifact,
+    and the protocol is v2-only. There is no legacy path — a KeyError here means
+    the bundle predates metered settlement and must be regenerated, not coerced.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise AttestorError(f"{name} must be an integer")
+    if not (0 <= value < 2**64):
+        raise AttestorError(f"{name} must fit in uint64")
+    return value
+
+
 @dataclass(frozen=True)
 class VerifiedClaim:
     session_id: bytes
@@ -381,6 +395,7 @@ class VerifiedClaim:
     output_commitment: bytes
     binding_nonce: bytes
     deadline: int
+    consumed_sec: int  # v1.18: billable enclave duration, bound into the nonce
 
 
 def verify_bundle(
@@ -404,11 +419,18 @@ def verify_bundle(
     input_commitment = _b32(bundle["input_commitment"], "input_commitment")
     output_commitment = _b32(bundle["output_commitment"], "output_commitment")
     bundle_nonce = _b32(bundle["binding_nonce"], "binding_nonce")
+    consumed_sec = _u64(bundle.get("consumed_sec"), "consumed_sec")
     token = bundle["attestation_token"]
 
     # (1) Recompute the binding nonce from the bundle's own fields (same scheme
     #     as the enclave and the contract). The bundle cannot lie about its nonce.
-    recomputed = compute_binding_nonce(session_id, model_digest, input_commitment, output_commitment)
+    #     v1.18: consumed_sec is part of the preimage, so the billed duration is
+    #     covered by the Google signature over eat_nonce just like the commitments.
+    #     A bundle without it fails at _u64 above — intentionally, since the
+    #     protocol is v2-only and pre-v2 bundles are dev artifacts to regenerate.
+    recomputed = compute_binding_nonce(
+        session_id, model_digest, input_commitment, output_commitment, consumed_sec
+    )
     if recomputed != bundle_nonce:
         raise AttestorError("bundle binding_nonce does not match its own fields")
 
@@ -449,6 +471,7 @@ def verify_bundle(
         output_commitment=output_commitment,
         binding_nonce=recomputed,
         deadline=deadline,
+        consumed_sec=consumed_sec,
     )
 
 
@@ -473,6 +496,7 @@ def _typed_data(chain_id: int, verifier_address: str, c: VerifiedClaim) -> dict[
                 {"name": "outputCommitment", "type": "bytes32"},
                 {"name": "bindingNonce", "type": "bytes32"},
                 {"name": "deadline", "type": "uint256"},
+                {"name": "consumedSec", "type": "uint64"},
             ],
         },
         "primaryType": "AttestationClaim",
@@ -490,6 +514,7 @@ def _typed_data(chain_id: int, verifier_address: str, c: VerifiedClaim) -> dict[
             "outputCommitment": c.output_commitment,
             "bindingNonce": c.binding_nonce,
             "deadline": c.deadline,
+            "consumedSec": c.consumed_sec,
         },
     }
 
@@ -515,6 +540,7 @@ def sign_claim(
             "outputCommitment": "0x" + claim.output_commitment.hex(),
             "bindingNonce": "0x" + claim.binding_nonce.hex(),
             "deadline": claim.deadline,
+            "consumedSec": claim.consumed_sec,
         },
         "signature": "0x" + signed.signature.hex(),
         "attestor": Account.from_key(private_key).address,
