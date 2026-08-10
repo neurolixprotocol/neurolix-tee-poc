@@ -84,9 +84,18 @@ BUNDLE_VERSION: Final[str] = "neurolix-attestation/v2"
 # Domain-separation tags. The *byte values* below are the SHA-256 of the tag
 # strings and are MIRRORED verbatim in NeurolixAttestationVerifier.sol as
 # `DST_NONCE`. If you ever change the tag string, regenerate and update BOTH.
-#   sha256(b"NEUROLIX/attestation/nonce/v1")
+# v1.18: bumped /v1 -> /v2 alongside the 168-byte preimage. Strictly speaking the
+# two changes are independent — a different preimage length already yields a
+# different hash — but leaving the tag at /v1 would have had the domain separator
+# assert a scheme that no longer exists. Done now because every fixture is being
+# regenerated anyway.
+# FOUR places carry this value and NOTHING checks that they agree: this file,
+# NeurolixAttestationVerifier.sol, verify.py, and DST_NONCE_TAG in the Solidity
+# test. Change them in the same commit.
+#   sha256(b"NEUROLIX/attestation/nonce/v2")
+#   v1 was e501d736b800d00539784c76a1f5334cb8f26b0bd7319fc02d2a6c149e9ba6d2
 DST_NONCE: Final[bytes] = bytes.fromhex(
-    "e501d736b800d00539784c76a1f5334cb8f26b0bd7319fc02d2a6c149e9ba6d2"
+    "117254d7707ce55039977d24974a1cb56dca1e6037c31143d063e4b877051232"
 )
 # These two are used only off-chain (input/output are never recomputed on-chain),
 # so they are kept as tag strings and hashed inside `_tagged_hash`.

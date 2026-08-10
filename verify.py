@@ -8,7 +8,10 @@ fingerprint below, which anyone can confirm once against Google's published
 root and then cache indefinitely.
 
     pip install cryptography
-    python3 verify.py attestations/bundle-pki-v4.json
+    python3 verify.py attestations/bundle-pki-v5.json
+
+Bundle schema v2 only. bundle-pki-v4.json predates consumed_sec in the nonce
+preimage and will be refused at check 1 — that is intended, not a regression.
 
 Exit code 0 if every check passes, 1 otherwise.
 
@@ -31,8 +34,13 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-# sha256(b"NEUROLIX/attestation/nonce/v1") — mirrored in the Solidity verifier.
-DST_NONCE = "e501d736b800d00539784c76a1f5334cb8f26b0bd7319fc02d2a6c149e9ba6d2"
+# sha256(b"NEUROLIX/attestation/nonce/v2") — mirrored in the Solidity verifier.
+# v1.18: bumped from /v1 alongside the 168-byte preimage. The two changes are
+# independent (different lengths already produce different hashes), but leaving
+# the tag at v1 would have had the domain separator assert a scheme that no
+# longer exists. Done now because every fixture is being regenerated anyway.
+# v1 was e501d736b800d00539784c76a1f5334cb8f26b0bd7319fc02d2a6c149e9ba6d2
+DST_NONCE = "117254d7707ce55039977d24974a1cb56dca1e6037c31143d063e4b877051232"
 
 # SHA-256 of the DER encoding of the Confidential Space Root CA, published at
 # https://confidentialcomputing.googleapis.com/.well-known/attestation-pki-root
@@ -46,6 +54,16 @@ EXPECTED_ISSUER = "https://confidentialcomputing.googleapis.com"
 # able to read one script with a single dependency rather than trace an import
 # graph. The cost is that a change to the verification logic must be applied in
 # BOTH files. If they ever disagree, bridge/attestor.py is authoritative.
+#
+# THAT COST CAME DUE ON 2026-08-04 AND WENT UNPAID FOR TWO DAYS. The v1.18
+# metering change added consumed_sec to the nonce preimage in attestation.py
+# and attestor.py, but not here. This script kept passing CI because it builds
+# the preimage inline and never imports compute_binding_nonce: on a v1 bundle
+# the 160-byte hash still matched, so it went green while the rest of the suite
+# failed loudly. A duplicate that fails SILENTLY is worse than one that breaks.
+#
+# Before touching the nonce scheme again, change all THREE:
+#   attestation.py (enclave) · bridge/attestor.py (signer) · verify.py (this file)
 
 
 def b64url(segment: str) -> bytes:
@@ -85,14 +103,33 @@ def verify(path: str) -> int:
 
     # ---- 1. The binding nonce is consistent with the bundle's own fields ----
     print("1. Commitment binding")
+    # v1.18 (bundle schema v2): consumed_sec closes the preimage as 8 big-endian
+    # bytes, taking it from 160 to 168. It is IN the preimage, not beside it, so
+    # the billed duration is covered by the Google signature over eat_nonce
+    # exactly like the commitments — an attestor cannot restate it freely.
+    # Fails closed on a bundle without the field: the protocol is v2-only by
+    # decision (2026-08-06) and a v1 bundle is a dev artifact to regenerate,
+    # never something to coerce into verifying.
+    consumed_sec = bundle.get("consumed_sec")
+    if not isinstance(consumed_sec, int) or isinstance(consumed_sec, bool):
+        r.check("bundle carries consumed_sec (schema v2)", False,
+                f"got {type(consumed_sec).__name__} — regenerate this bundle against the current enclave")
+        print("\nRESULT: bundle predates the v2 nonce scheme; remaining checks are meaningless\n")
+        return 1
+    if not (0 <= consumed_sec < 2**64):
+        r.check("consumed_sec fits in uint64", False, str(consumed_sec))
+        return 1
+
     preimage = bytes.fromhex(
         DST_NONCE
         + strip0x(bundle["session_id"])
         + strip0x(bundle["model_digest"])
         + strip0x(bundle["input_commitment"])
         + strip0x(bundle["output_commitment"])
+        + f"{consumed_sec:016x}"  # uint64 big-endian == abi.encodePacked(uint64) in Solidity
     )
-    r.check("preimage is 160 bytes", len(preimage) == 160, f"{len(preimage)} bytes")
+    r.check("preimage is 168 bytes", len(preimage) == 168, f"{len(preimage)} bytes")
+    r.note("consumed_sec (billable seconds)", str(consumed_sec))
     recomputed = hashlib.sha256(preimage).hexdigest()
     r.check("recomputed nonce matches bundle", recomputed == strip0x(bundle["binding_nonce"]))
 
