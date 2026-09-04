@@ -1,4 +1,4 @@
 # attestor service — pin + hash-lock in production (pip --require-hashes)
 PyJWT[crypto]==2.13.0
 eth-account==0.13.7
-cryptography==49.0.0
+cryptography==50.0.1
